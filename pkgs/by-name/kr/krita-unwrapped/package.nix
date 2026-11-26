@@ -2,6 +2,7 @@
   stdenv,
   SDL2,
   boost,
+  bzip2,
   cmake,
   curl,
   eigen_5,
@@ -35,6 +36,107 @@
   zug,
 }:
 
+let
+  isDarwin = stdenv.hostPlatform.isDarwin;
+
+  # KDE Frameworks 6 is only exercised on Linux and FreeBSD. Widen its metadata
+  # here so the private Darwin scope can use the frameworks Krita needs.
+  forAllPlatforms =
+    drv:
+    drv.overrideAttrs (old: {
+      meta = (old.meta or { }) // {
+        platforms = lib.platforms.all;
+      };
+    });
+
+  withoutInputs =
+    inputs: names: lib.filter (input: !(builtins.elem (lib.getName input) names)) inputs;
+
+  waylandInputs = [
+    "plasma-wayland-protocols"
+    "qtwayland"
+    "wayland"
+    "wayland-protocols"
+  ];
+
+  kdePackages' =
+    if isDarwin then
+      kdePackages.overrideScope (
+        self: super:
+        let
+          frameworks = builtins.listToAttrs (
+            map (name: {
+              inherit name;
+              value = forAllPlatforms super.${name};
+            }) (builtins.attrNames super.frameworks)
+          );
+        in
+        frameworks
+        // {
+          mlt = forAllPlatforms super.mlt;
+          poppler = forAllPlatforms super.poppler;
+          libkdcraw = forAllPlatforms super.libkdcraw;
+          quazip = forAllPlatforms super.quazip;
+          kseexpr = forAllPlatforms super.kseexpr;
+
+          kdoctools = forAllPlatforms (
+            super.kdoctools.overrideAttrs (old: {
+              # macOS' QStandardPaths ignores XDG_DATA_DIRS, exposing the
+              # doubled datadir in kdoctools' compiled-in catalog path.
+              patches = (old.patches or [ ]) ++ [ ./kdoctools-absolute-datadir.patch ];
+            })
+          );
+
+          karchive = forAllPlatforms (
+            super.karchive.overrideAttrs (old: {
+              # Upstream requires BZip2 on every platform; nixpkgs currently
+              # only receives it transitively on Linux.
+              buildInputs = (old.buildInputs or [ ]) ++ [ bzip2 ];
+            })
+          );
+
+          kguiaddons = forAllPlatforms (
+            super.kguiaddons.overrideAttrs (old: {
+              buildInputs = withoutInputs (old.buildInputs or [ ]) [ "qtwayland" ];
+              propagatedBuildInputs = withoutInputs (old.propagatedBuildInputs or [ ]) waylandInputs;
+            })
+          );
+
+          kwindowsystem = forAllPlatforms (
+            super.kwindowsystem.overrideAttrs (old: {
+              buildInputs = withoutInputs (old.buildInputs or [ ]) [ "qtwayland" ];
+              propagatedBuildInputs = withoutInputs (old.propagatedBuildInputs or [ ]) waylandInputs;
+            })
+          );
+
+          kio = forAllPlatforms (
+            super.kio.overrideAttrs (old: {
+              # KIO only uses ACL/xattr and Linux mount support on Linux.
+              buildInputs = withoutInputs (old.buildInputs or [ ]) [
+                "acl"
+                "attr"
+                "util-linux"
+              ];
+            })
+          );
+
+          kauth = forAllPlatforms (
+            super.kauth.overrideAttrs (old: {
+              # KAuth has a native macOS backend; polkit is Linux-only.
+              propagatedBuildInputs = withoutInputs (old.propagatedBuildInputs or [ ]) [
+                "polkit-qt-1"
+              ];
+            })
+          );
+        }
+      )
+    else
+      kdePackages;
+
+  # kseexpr is a top-level package, so point it at the private Darwin scope too.
+  kseexpr' =
+    if isDarwin then forAllPlatforms (kseexpr.override { kdePackages = kdePackages'; }) else kseexpr;
+in
 stdenv.mkDerivation (finalAttrs: {
   pname = "krita-unwrapped";
 
@@ -46,7 +148,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   nativeBuildInputs = [
     cmake
-    kdePackages.extra-cmake-modules
+    kdePackages'.extra-cmake-modules
     pkg-config
     python3Packages.sip
     qt6.wrapQtAppsHook
@@ -73,7 +175,7 @@ stdenv.mkDerivation (finalAttrs: {
     xsimd
     curl
     immer
-    kseexpr
+    kseexpr'
     libmypaint
     libunibreak
     libwebp
@@ -84,7 +186,7 @@ stdenv.mkDerivation (finalAttrs: {
     qt6.qtmultimedia
     qt6.qttools
   ]
-  ++ (with kdePackages; [
+  ++ (with kdePackages'; [
     breeze-icons
     karchive
     kcompletion
@@ -138,6 +240,13 @@ stdenv.mkDerivation (finalAttrs: {
       url = "https://invent.kde.org/graphics/krita/-/commit/3f5b2882017f4e12c9b021de0ea24e6dd2eb26dd.patch";
       hash = "sha256-Oq/ojwTYt2bmXQm0UuIVCIN+7PVgTO1WGbcFUnDDFIA=";
     })
+  ]
+  ++ lib.optionals isDarwin [
+    # The Finder integration plugins use xcodebuild archive, which cannot run
+    # in the Nix build sandbox.
+    ./krita-skip-macos-integration.patch
+    # Nix's Qt forwarding headers do not expose QMutex through <qmutex.h>.
+    ./krita-qt6-macos-qmutex.patch
   ];
 
   cmakeBuildType = "RelWithDebInfo";
@@ -147,7 +256,8 @@ stdenv.mkDerivation (finalAttrs: {
     "-DALLOW_UNSTABLE=QT6"
     "-DENABLE_UPDATERS=OFF"
     "-DBUILD_KRITA_QT_DESIGNER_PLUGINS=ON"
-  ];
+  ]
+  ++ lib.optional isDarwin "-DKRITA_SKIP_MACOS_INTEGRATION=ON";
 
   meta = {
     description = "Free and open source painting application";
@@ -156,7 +266,7 @@ stdenv.mkDerivation (finalAttrs: {
       sifmelcara
     ];
     mainProgram = "krita";
-    platforms = lib.platforms.linux;
+    platforms = lib.platforms.linux ++ lib.platforms.darwin;
     license = lib.licenses.gpl3Only;
   };
 })
